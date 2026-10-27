@@ -228,7 +228,7 @@ def main():
             vuln_attr = "true" if has_vuln else "false"
             html_content += f"""
         <div class="repo-box" data-vulnerable="{vuln_attr}">
-            <div class="repo-header">📁 {repo}</div>
+            <div class="repo-header">Repo: {repo}</div>
             <div class="repo-body">
                 <ul>
 """
