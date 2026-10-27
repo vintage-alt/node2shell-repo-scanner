@@ -1,15 +1,15 @@
 import os
+import time
 import requests
 import base64
 import yaml
 import json
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_ORG = os.getenv("GITHUB_ORG") # Optional: Leave blank for personal account, or set to your organization name
+GITHUB_ORG = os.getenv("GITHUB_ORG", "").strip()
 HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
 
 # Vulnerability thresholds for Node2Shell (CVE-2026-111497)
-# Versions below these are vulnerable: 22.23.4, 24.22.1, 26.12.1
 SAFE_VERSIONS = {
     22: (23, 4),
     24: (22, 1),
@@ -17,7 +17,6 @@ SAFE_VERSIONS = {
 }
 
 def is_version_vulnerable(version_str):
-    """Parses a version string and checks if it falls below the patch threshold."""
     clean_v = version_str.strip().lstrip('v').split('-')[0]
     parts = clean_v.split('.')
     try:
@@ -25,10 +24,10 @@ def is_version_vulnerable(version_str):
         minor = int(parts[1]) if len(parts) > 1 else 0
         patch = int(parts[2]) if len(parts) > 2 else 0
     except ValueError:
-        return True # Unknown format, flag for safety
+        return True 
 
     if major < 20:
-        return True # Node 20 and older received no fix
+        return True 
     if major in SAFE_VERSIONS:
         s_minor, s_patch = SAFE_VERSIONS[major]
         if minor < s_minor:
@@ -38,10 +37,18 @@ def is_version_vulnerable(version_str):
         return False
     return False
 
+def safe_get(url):
+    """Wrapper to make requests safely with timeouts and exception handling."""
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=10)
+        return res
+    except requests.exceptions.RequestException:
+        return None
+
 def get_file_content(repo_full_name, path):
     url = f"https://api.github.com/repos/{repo_full_name}/contents/{path}"
-    res = requests.get(url, headers=HEADERS)
-    if res.status_code == 200:
+    res = safe_get(url)
+    if res and res.status_code == 200:
         content_b64 = res.json().get("content", "")
         try:
             return base64.b64decode(content_b64).decode('utf-8')
@@ -68,8 +75,8 @@ def extract_node_versions_from_workflow(data):
 def scan_github_actions(repo):
     findings = []
     url = f"https://api.github.com/repos/{repo}/contents/.github/workflows"
-    res = requests.get(url, headers=HEADERS)
-    if res.status_code == 200:
+    res = safe_get(url)
+    if res and res.status_code == 200:
         files = res.json()
         if isinstance(files, list):
             for file in files:
@@ -125,49 +132,68 @@ def scan_repository(repo):
 
     return findings
 
-def main():
+def fetch_paginated_repos(url):
     repos = []
     page = 1
-    
-    if GITHUB_ORG:
-        print(f"Fetching repositories for organization: {GITHUB_ORG}...")
-        base_url = f"https://api.github.com/orgs/{GITHUB_ORG}/repos"
-    else:
-        print("Fetching repositories for authenticated user...")
-        base_url = "https://api.github.com/user/repos"
-
     while True:
-        url = f"{base_url}?per_page=100&page={page}&type=all"
-        res = requests.get(url, headers=HEADERS)
-        if res.status_code != 200:
-            print(f"Failed to fetch repositories: {res.status_code} - {res.text}")
+        target_url = f"{url}&page={page}&per_page=100" if "?" in url else f"{url}?page={page}&per_page=100"
+        res = safe_get(target_url)
+        if not res or res.status_code != 200:
             break
         data = res.json()
         if not data or not isinstance(data, list):
             break
-        
         repos.extend([r['full_name'] for r in data])
-        print(f"Fetched page {page} ({len(data)} repositories)...")
-        
         if len(data) < 100:
             break
         page += 1
+    return repos
 
-    print(f"\nTotal repositories loaded: {len(repos)}. Starting vulnerability scan...\n")
+def main():
+    repos = []
+    targets = []
+    
+    if GITHUB_ORG.lower() == "all":
+        print("Auto-discovering organizations for the authenticated user...")
+        orgs_res = safe_get("https://api.github.com/user/orgs")
+        if orgs_res and orgs_res.status_code == 200:
+            orgs = orgs_res.json()
+            targets = [o['login'] for o in orgs]
+            print(f"Found organizations: {', '.join(targets)}")
+        targets.insert(0, "PERSONAL_ACCOUNT")
+    elif GITHUB_ORG:
+        targets = [o.strip() for o in GITHUB_ORG.split(",")]
+    else:
+        targets = ["PERSONAL_ACCOUNT"]
+
+    for target in targets:
+        if target == "PERSONAL_ACCOUNT":
+            print("Fetching repositories for personal account...")
+            repos.extend(fetch_paginated_repos("https://api.github.com/user/repos?type=owner"))
+        else:
+            print(f"Fetching repositories for organization: {target}...")
+            repos.extend(fetch_paginated_repos(f"https://api.github.com/orgs/{target}/repos?type=all"))
+
+    repos = list(dict.fromkeys(repos))
+    print(f"\nTotal unique repositories loaded: {len(repos)}. Starting vulnerability scan...\n")
     
     repo_results = {}
     vulnerable_repo_count = 0
-    for repo in repos:
+    
+    for i, repo in enumerate(repos):
+        print(f"Scanning [{i+1}/{len(repos)}]: {repo}")
         findings = scan_repository(repo)
         if findings:
             has_vuln = any(status == "vulnerable" for status, _ in findings)
             if has_vuln:
                 vulnerable_repo_count += 1
             repo_results[repo] = (has_vuln, findings)
+        
+        # Small polite delay to prevent network choking / secondary rate limits
+        time.sleep(0.1)
 
-    target_name = GITHUB_ORG if GITHUB_ORG else "Personal User Account"
+    target_display = GITHUB_ORG if GITHUB_ORG else "Personal User Account"
     
-    # Build HTML Report with filtering controls
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -198,7 +224,7 @@ def main():
 <body>
     <div class="container">
         <h1>Node2Shell (CVE-2026-111497) Audit Report</h1>
-        <p>Target Scope: <strong>{target_name}</strong> | Automated vulnerability scan results across repositories for runtime Node.js exposure.</p>
+        <p>Target Scope: <strong>{target_display}</strong> | Automated vulnerability scan results across repositories for runtime Node.js exposure.</p>
         
         <div class="summary">
             <div class="card">
@@ -256,11 +282,9 @@ def main():
 
     <script>
         function filterReport(type, btn) {
-            // Update active button state
             document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
 
-            // Toggle repository visibility
             const boxes = document.querySelectorAll('.repo-box');
             boxes.forEach(box => {
                 if (type === 'all') {
@@ -279,9 +303,9 @@ def main():
 </html>
 """
 
-    with open("node2shell_report.html", "w") as f:
+    with open("node2shell_report.html", "w", encoding="utf-8") as f:
         f.write(html_content)
-    print("Audit complete! HTML report with filter options saved to node2shell_report.html")
+    print("\nAudit complete! HTML report saved to node2shell_report.html")
 
 if __name__ == "__main__":
     main()
